@@ -1126,7 +1126,7 @@ class LTLMTrainer(SFTTrainer):
             else:
                 self._signature_columns = ["input_ids", "labels", "seq_lengths", "completion_mask", "assistant_masks"]
 
-    def loss_func(self, model_output, labels, shift_labels=False, epsilon: float = 0.1, ignore_index: int = -100):
+    def label_smoother(self, model_output, labels, shift_labels=False, epsilon: float = 0.1, ignore_index: int = -100):
         logits = model_output["logits"] if isinstance(model_output, dict) else model_output[0]
         if shift_labels:
             logits = logits[..., :-1, :].contiguous()
@@ -1154,7 +1154,7 @@ class LTLMTrainer(SFTTrainer):
         return (1 - epsilon) * nll_loss + epsilon * smoothed_loss
 
 
-    def label_smoother(
+    def _compute_loss(
         self,
         model: nn.Module,
         inputs: dict[str, torch.Tensor | Any],
