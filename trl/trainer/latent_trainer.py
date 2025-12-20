@@ -61,6 +61,10 @@ from .utils import (
     selective_log_softmax,
 )
 
+from .sft_trainer import SFTTrainer
+from .latent_config import LTLMConfig
+from transformers.models.latent_gpt2.modeling_gpt2 import GPT2Config, GPT2ModelBase, LanguageAutoencoder
+
 
 if is_peft_available():
     from peft import PeftConfig, PeftModel, PeftType, get_peft_model
@@ -576,7 +580,8 @@ class LTLMTrainer(SFTTrainer):
     def __init__(
         self,
         model: str | PreTrainedModel,
-        args: SFTConfig | TrainingArguments | None = None,
+        window_size: int=4,
+        args: LTLMConfig | TrainingArguments | None = None,
         data_collator: DataCollator | None = None,
         train_dataset: Dataset | IterableDataset | None = None,
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
@@ -601,23 +606,14 @@ class LTLMTrainer(SFTTrainer):
             dict_args.pop("push_to_hub_token")
             args = SFTConfig(**dict_args)
 
-        # Model
-        if isinstance(model, str):
-            model_init_kwargs = args.model_init_kwargs or {}
-            # Special case for DeepSpeed: requires device_map=None ("auto" fails)
-            if args.distributed_state.distributed_type == "DEEPSPEED":
-                model_init_kwargs["device_map"] = None
-            model = create_model_from_path(model, **model_init_kwargs)
-        else:
-            if args.model_init_kwargs is not None:
-                logger.warning(
-                    "You passed `model_init_kwargs` to the `SFTConfig`, but your model is already instantiated. "
-                    "The `model_init_kwargs` will be ignored."
-                )
+
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoProcessor.from_pretrained(get_config_model_id(model.config))
+            if isinstance(model, str):
+                processing_class = AutoProcessor.from_pretrained(model)
+            else:
+                processing_class = AutoProcessor.from_pretrained(get_config_model_id(model.config))
 
         # Handle pad token for processors or tokenizers
         if isinstance(processing_class, ProcessorMixin):
@@ -640,6 +636,9 @@ class LTLMTrainer(SFTTrainer):
                 )
             tokenizer.eos_token_id = eos_token_id
 
+        if tokenizer.pad_token is None:
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
         if args.chat_template_path is not None:
             if os.path.isfile(args.chat_template_path) and args.chat_template_path.endswith((".jinja", ".j2")):
                 with open(args.chat_template_path, encoding="utf-8") as chat_template_file:
@@ -651,6 +650,60 @@ class LTLMTrainer(SFTTrainer):
                 )
         else:
             added_tokens = []
+
+
+
+        # Model
+
+        if isinstance(model, str):
+            if model not in ["openai-community/gpt2", "openai-community/gpt2-medium", "openai-community/gpt2-large", "openai-community/gpt2-xl"]:
+                raise Exception("Model {} is invalid".format(model))
+            
+            model_init_kwargs = args.model_init_kwargs or {}
+            # Special case for DeepSpeed: requires device_map=None ("auto" fails)
+            if args.distributed_state.distributed_type == "DEEPSPEED":
+                model_init_kwargs["device_map"] = None
+
+
+            num_hidden_layers_encoder = args.model_init_kwargs["num_hidden_layers_encoder"]
+            num_hidden_layers_decoder = args.model_init_kwargs["num_hidden_layers_decoder"]
+            del args.model_init_kwargs["num_hidden_layers_encoder"]
+            del args.model_init_kwargs["num_hidden_layers_decoder"]
+
+            # pretrained_model = create_model_from_path(model, **model_init_kwargs)
+            
+
+
+            # model = LanguageAutoencoder(model_config, window_size=window_size)
+            pretrained_model = GPT2ModelBase.from_pretrained(model, **model_init_kwargs)
+            
+
+            if pretrained_model.config.pad_token_id is None:
+                pretrained_model.config.pad_token_id = tokenizer.pad_token_id
+                
+            pretrained_model.resize_token_embeddings(len(tokenizer))
+
+            print("{}".format(pretrained_model))
+            # print("[1]: {}".format(pretrained_model[1]))
+            # print(len(pretrained_model))
+
+            # import pdb; pdb.set_trace()
+            model = LanguageAutoencoder.build_from_pretrained(
+                pretrained_model=pretrained_model,
+                window_size=window_size,
+                num_hidden_layers_encoder=num_hidden_layers_encoder,
+                num_hidden_layers_decoder=num_hidden_layers_decoder
+            )
+
+
+        else:
+            if args.model_init_kwargs is not None:
+                logger.warning(
+                    "You passed `model_init_kwargs` to the `SFTConfig`, but your model is already instantiated. "
+                    "The `model_init_kwargs` will be ignored."
+                )
+
+
 
         # Catch some wrong configurations related to VLMs
         if self._is_vlm and args.packing:
