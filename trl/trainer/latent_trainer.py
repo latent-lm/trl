@@ -1179,11 +1179,16 @@ class LTLMTrainer(SFTTrainer):
             else:
                 self._signature_columns = ["input_ids", "labels", "seq_lengths", "completion_mask", "assistant_masks"]
 
-    def label_smoother(self, model_output, labels, shift_labels=False, epsilon: float = 0.1, ignore_index: int = -100):
+    def label_smoother(self, model_output, labels, shift_labels=0, epsilon: float = 0.1, ignore_index: int = -100):
         logits = model_output["logits"] if isinstance(model_output, dict) else model_output[0]
+
+
+        # Either do not shift, for reconstruction, or shift by the window_size
         if shift_labels:
-            logits = logits[..., :-1, :].contiguous()
-            labels = labels[..., 1:].contiguous()
+            # logits = logits[..., :-1, :].contiguous()
+            # labels = labels[..., 1:].contiguous()
+            logits = logits[..., :-window_size, :].contiguous()
+            labels = labels[..., window_size:].contiguous()
 
         log_probs = -nn.functional.log_softmax(logits, dim=-1)
         if labels.dim() == log_probs.dim() - 1:
@@ -1246,7 +1251,7 @@ class LTLMTrainer(SFTTrainer):
             if num_items_in_batch is not None:
                 kwargs["num_items_in_batch"] = num_items_in_batch
             inputs = {**inputs, **kwargs}
-        outputs = model(**inputs)
+        rec_outputs = model(**inputs)
 
         assert compute_loss_func is None
         assert labels is not None
@@ -1272,10 +1277,29 @@ class LTLMTrainer(SFTTrainer):
             if _is_peft_model(unwrapped_model)
             else unwrapped_model._get_name()
         )
-        if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
-            loss = self.label_smoother(outputs, labels, shift_labels=True)
-        else:
-            loss = self.label_smoother(outputs, labels)
+
+
+
+        # if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+        #     loss = self.label_smoother(outputs, labels, shift_labels=True)
+        # else:
+        #     loss = self.label_smoother(outputs, labels)
+
+        # Reconstruction: Do not shift labels
+        rec_loss = self.label_smoother(rec_outputs, labels, shift_labels=0)
+
+        inputs["use_latent_ar"] = True
+
+        ar_outputs, ltar_output, encoder_output = model(**inputs)
+
+        ar_loss = self.label_smoother(ar_outputs, labels, shift_labels=model.window_size)
+
+        ltar_output_shifted = ltar_output[:, :-1, :]
+        encoder_output_shifted = encoder_output[:, 1:, :]
+        fm_loss = self.model.fm.compute_loss(ltar_output_shifted, encoder_output_shifted)
+
+        loss = rec_loss + ar_loss + fm_loss
+
         # else:
         #     if isinstance(outputs, dict) and "loss" not in outputs:
         #         raise ValueError(
@@ -1292,7 +1316,7 @@ class LTLMTrainer(SFTTrainer):
         ):
             loss *= self.accelerator.num_processes if self.args.n_gpu <= 1 else self.args.n_gpu
 
-        return (loss, outputs) if return_outputs else loss
+        return (loss, ar_outputs) if return_outputs else loss
 
     def compute_loss(
         self,
