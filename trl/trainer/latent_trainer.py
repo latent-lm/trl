@@ -64,6 +64,7 @@ from .utils import (
 from .sft_trainer import SFTTrainer
 from .latent_config import LTLMConfig
 from transformers.models.latent_gpt2.modeling_gpt2 import GPT2Config, GPT2ModelBase, LanguageAutoencoder
+from transformers.models.latent_gpt2.configuration_latent_gpt2 import LatentGPT2Config
 
 
 if is_peft_available():
@@ -665,10 +666,10 @@ class LTLMTrainer(SFTTrainer):
                 model_init_kwargs["device_map"] = None
 
 
-            num_hidden_layers_encoder = args.model_init_kwargs["num_hidden_layers_encoder"]
-            num_hidden_layers_decoder = args.model_init_kwargs["num_hidden_layers_decoder"]
-            del args.model_init_kwargs["num_hidden_layers_encoder"]
-            del args.model_init_kwargs["num_hidden_layers_decoder"]
+            # num_hidden_layers_encoder = args.model_init_kwargs["num_hidden_layers_encoder"]
+            # num_hidden_layers_decoder = args.model_init_kwargs["num_hidden_layers_decoder"]
+            # del args.model_init_kwargs["num_hidden_layers_encoder"]
+            # del args.model_init_kwargs["num_hidden_layers_decoder"]
 
             # pretrained_model = create_model_from_path(model, **model_init_kwargs)
             
@@ -687,13 +688,23 @@ class LTLMTrainer(SFTTrainer):
             # print("[1]: {}".format(pretrained_model[1]))
             # print(len(pretrained_model))
 
+            
+            ltlm_model_config_args = vars(pretrained_model.config)
+            ltlm_model_config_args.update(model_init_kwargs)
+
+            ltlm_model_config = LatentGPT2Config(**ltlm_model_config_args)
+
+            assert ltlm_model_config.pad_token_id is not None and ltlm_model_config.pad_token_id == pretrained_model.config.pad_token_id
+
             # import pdb; pdb.set_trace()
-            model = LanguageAutoencoder.build_from_pretrained(
-                pretrained_model=pretrained_model,
-                window_size=window_size,
-                num_hidden_layers_encoder=num_hidden_layers_encoder,
-                num_hidden_layers_decoder=num_hidden_layers_decoder
-            )
+            # model = LanguageAutoencoder.build_from_pretrained(
+            #     pretrained_model=pretrained_model,
+            #     window_size=window_size,
+            #     num_hidden_layers_encoder=num_hidden_layers_encoder,
+            #     num_hidden_layers_decoder=num_hidden_layers_decoder
+            # )
+            model = LanguageAutoencoder(ltlm_model_config)
+            model.init_weight_from_pretrained(pretrained_model)
 
 
         else:
@@ -1180,7 +1191,7 @@ class LTLMTrainer(SFTTrainer):
                 self._signature_columns = ["input_ids", "labels", "seq_lengths", "completion_mask", "assistant_masks"]
 
     def label_smoother(self, model_output, labels, shift_labels=0, epsilon: float = 0.1, ignore_index: int = -100):
-        logits = model_output["logits"] if isinstance(model_output, dict) else model_output[0]
+        logits = model_output["logits"] if isinstance(model_output, dict) else (model_output.logits if model_output.logits is not None else model_output[0])
 
 
         # Either do not shift, for reconstruction, or shift by the window_size
@@ -1251,6 +1262,8 @@ class LTLMTrainer(SFTTrainer):
             if num_items_in_batch is not None:
                 kwargs["num_items_in_batch"] = num_items_in_batch
             inputs = {**inputs, **kwargs}
+
+        inputs["use_latent_ar"] = False
         rec_outputs = model(**inputs)
 
         assert compute_loss_func is None
@@ -1278,24 +1291,27 @@ class LTLMTrainer(SFTTrainer):
             else unwrapped_model._get_name()
         )
 
-
-
         # if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
         #     loss = self.label_smoother(outputs, labels, shift_labels=True)
         # else:
         #     loss = self.label_smoother(outputs, labels)
 
-        # Reconstruction: Do not shift labels
+        # Objective 1: Reconstruction: Do not shift labels
         rec_loss = self.label_smoother(rec_outputs, labels, shift_labels=0)
+
+
 
         inputs["use_latent_ar"] = True
 
         ar_outputs, ltar_output, encoder_output = model(**inputs)
 
+        # Objective 2: AR: Shift labels
         ar_loss = self.label_smoother(ar_outputs, labels, shift_labels=model.window_size)
 
-        ltar_output_shifted = ltar_output[:, :-1, :]
-        encoder_output_shifted = encoder_output[:, 1:, :]
+        ltar_output_shifted = ltar_output.last_tail_hidden_state[:, :-1, :]
+        encoder_output_shifted = encoder_output.last_tail_hidden_state[:, 1:, :]
+
+        # Objective 3: Flow Matching
         fm_loss = self.model.fm.compute_loss(ltar_output_shifted, encoder_output_shifted)
 
         loss = rec_loss + ar_loss + fm_loss
