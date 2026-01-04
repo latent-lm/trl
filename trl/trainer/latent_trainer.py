@@ -63,7 +63,8 @@ from .utils import (
 
 from .sft_trainer import SFTTrainer
 from .latent_config import LTLMConfig
-from transformers.models.latent_gpt2.modeling_gpt2 import GPT2Config, GPT2ModelBase, LanguageAutoencoder
+from transformers.models.gpt2.modeling_gpt2 import GPT2Config
+from transformers.models.latent_gpt2.modeling_gpt2 import GPT2ModelBase, LanguageAutoencoder
 from transformers.models.latent_gpt2.configuration_latent_gpt2 import LatentGPT2Config
 
 
@@ -1190,7 +1191,7 @@ class LTLMTrainer(SFTTrainer):
             else:
                 self._signature_columns = ["input_ids", "labels", "seq_lengths", "completion_mask", "assistant_masks"]
 
-    def label_smoother(self, model_output, labels, shift_labels=0, epsilon: float = 0.1, ignore_index: int = -100):
+    def compute_smoothed_loss(self, model_output, labels, shift_labels=0, epsilon: float = 0.1, ignore_index: int = -100):
         logits = model_output["logits"] if isinstance(model_output, dict) else (model_output.logits if model_output.logits is not None else model_output[0])
 
 
@@ -1198,8 +1199,8 @@ class LTLMTrainer(SFTTrainer):
         if shift_labels:
             # logits = logits[..., :-1, :].contiguous()
             # labels = labels[..., 1:].contiguous()
-            logits = logits[..., :-window_size, :].contiguous()
-            labels = labels[..., window_size:].contiguous()
+            logits = logits[..., :-shift_labels, :].contiguous()
+            labels = labels[..., shift_labels:].contiguous()
 
         log_probs = -nn.functional.log_softmax(logits, dim=-1)
         if labels.dim() == log_probs.dim() - 1:
@@ -1253,7 +1254,8 @@ class LTLMTrainer(SFTTrainer):
         if pc is not None and pc.sp_backend == "deepspeed" and pc.sp_enabled:
             return self._deepspeed_sp_compute_loss(model, inputs, return_outputs, pc)
 
-        if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
+        # if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
+        if "labels" in inputs:
             labels = inputs.pop("labels")
         else:
             labels = None
@@ -1266,7 +1268,7 @@ class LTLMTrainer(SFTTrainer):
         inputs["use_latent_ar"] = False
         rec_outputs = model(**inputs)
 
-        assert compute_loss_func is None
+        assert self.compute_loss_func is None
         assert labels is not None
 
         # User-defined compute_loss function
@@ -1282,48 +1284,51 @@ class LTLMTrainer(SFTTrainer):
         #         num_items_in_batch=num_items_in_batch,
         #     )
         # # Default HF loss handling (label smoothing) if no custom loss function
+        
+        # # elif labels is not None:
+        # unwrapped_model = self.accelerator.unwrap_model(model)
+        # model_name = (
+        #     unwrapped_model.base_model.model._get_name()
+        #     if _is_peft_model(unwrapped_model)
+        #     else unwrapped_model._get_name()
+        # )
 
-        # elif labels is not None:
-        unwrapped_model = self.accelerator.unwrap_model(model)
-        model_name = (
-            unwrapped_model.base_model.model._get_name()
-            if _is_peft_model(unwrapped_model)
-            else unwrapped_model._get_name()
-        )
+        # # if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+        # #     loss = self.label_smoother(outputs, labels, shift_labels=True)
+        # # else:
+        # #     loss = self.label_smoother(outputs, labels)
 
-        # if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
-        #     loss = self.label_smoother(outputs, labels, shift_labels=True)
-        # else:
-        #     loss = self.label_smoother(outputs, labels)
-
+        # Total loss
+        loss: float = 0
         # Objective 1: Reconstruction: Do not shift labels
-        rec_loss = self.label_smoother(rec_outputs, labels, shift_labels=0)
-
-
+        rec_loss = self.compute_smoothed_loss(rec_outputs, labels, shift_labels=0)
+        loss += rec_loss
 
         inputs["use_latent_ar"] = True
 
         ar_outputs, ltar_output, encoder_output = model(**inputs)
 
-        # Objective 2: AR: Shift labels
-        ar_loss = self.label_smoother(ar_outputs, labels, shift_labels=model.window_size)
+        # If the model enables Latent-AR
+        if self.model.fm is not None:
+            # Objective 2: AR: Shift labels
+            ar_loss = self.compute_smoothed_loss(ar_outputs, labels, shift_labels=model.config.window_size)
+            loss += ar_loss
 
-        ltar_output_shifted = ltar_output.last_tail_hidden_state[:, :-1, :]
-        encoder_output_shifted = encoder_output.last_tail_hidden_state[:, 1:, :]
+            ltar_output_shifted = ltar_output.last_tail_hidden_state[:, :-1, :]
+            encoder_output_shifted = encoder_output.last_tail_hidden_state[:, 1:, :]
 
-        # Objective 3: Flow Matching
-        fm_loss = self.model.fm.compute_loss(ltar_output_shifted, encoder_output_shifted)
+            # Objective 3: Flow Matching
+            fm_loss = self.model.fm.compute_loss(ltar_output_shifted, encoder_output_shifted)
+            loss += fm_loss
 
-        loss = rec_loss + ar_loss + fm_loss
-
-        # else:
-        #     if isinstance(outputs, dict) and "loss" not in outputs:
-        #         raise ValueError(
-        #             "The model did not return a loss from the inputs, only the following keys: "
-        #             f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
-        #         )
-        #     # We don't use .loss here since the model may return tuples instead of ModelOutput.
-        #     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            # else:
+            #     if isinstance(outputs, dict) and "loss" not in outputs:
+            #         raise ValueError(
+            #             "The model did not return a loss from the inputs, only the following keys: "
+            #             f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+            #         )
+            #     # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            #     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
         if (
             self.args.average_tokens_across_devices
