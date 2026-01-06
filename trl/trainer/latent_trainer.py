@@ -22,6 +22,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import wandb
 from accelerate import PartialState, logging
 from datasets import Dataset, IterableDataset
 from transformers import (
@@ -1194,13 +1195,19 @@ class LTLMTrainer(SFTTrainer):
     def compute_smoothed_loss(self, model_output, labels, shift_labels=0, epsilon: float = 0.1, ignore_index: int = -100):
         logits = model_output["logits"] if isinstance(model_output, dict) else (model_output.logits if model_output.logits is not None else model_output[0])
 
-
         # Either do not shift, for reconstruction, or shift by the window_size
         if shift_labels:
-            # logits = logits[..., :-1, :].contiguous()
-            # labels = labels[..., 1:].contiguous()
             logits = logits[..., :-shift_labels, :].contiguous()
             labels = labels[..., shift_labels:].contiguous()
+
+        # TODO: Claude Code update, double check, Ensure logits and labels have the same sequence length
+        logits_seq_len = logits.size(-2)
+        labels_seq_len = labels.size(-1)
+        if logits_seq_len != labels_seq_len:
+            min_len = min(logits_seq_len, labels_seq_len)
+            logits = logits[..., :min_len, :].contiguous()
+            labels = labels[..., :min_len].contiguous()
+        # TODO: Claude Code update ends
 
         log_probs = -nn.functional.log_softmax(logits, dim=-1)
         if labels.dim() == log_probs.dim() - 1:
@@ -1222,7 +1229,6 @@ class LTLMTrainer(SFTTrainer):
         nll_loss = nll_loss.sum() / num_active_elements
         smoothed_loss = smoothed_loss.sum() / (num_active_elements * log_probs.shape[-1])
         return (1 - epsilon) * nll_loss + epsilon * smoothed_loss
-
 
     def _compute_loss(
         self,
@@ -1298,18 +1304,21 @@ class LTLMTrainer(SFTTrainer):
         # # else:
         # #     loss = self.label_smoother(outputs, labels)
 
-        # Total loss
+        # Total loss & Final output
         loss: float = 0
+        model_outputs = None
+
         # Objective 1: Reconstruction: Do not shift labels
         rec_loss = self.compute_smoothed_loss(rec_outputs, labels, shift_labels=0)
         loss += rec_loss
-
-        inputs["use_latent_ar"] = True
-
-        ar_outputs, ltar_output, encoder_output = model(**inputs)
+        model_outputs = rec_outputs
 
         # If the model enables Latent-AR
+        ar_outputs = None
         if self.model.fm is not None:
+            inputs["use_latent_ar"] = True
+            ar_outputs, ltar_output, encoder_output = model(**inputs)
+
             # Objective 2: AR: Shift labels
             ar_loss = self.compute_smoothed_loss(ar_outputs, labels, shift_labels=model.config.window_size)
             loss += ar_loss
@@ -1329,6 +1338,8 @@ class LTLMTrainer(SFTTrainer):
             #         )
             #     # We don't use .loss here since the model may return tuples instead of ModelOutput.
             #     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            
+            model_outputs = ar_outputs
 
         if (
             self.args.average_tokens_across_devices
@@ -1337,7 +1348,7 @@ class LTLMTrainer(SFTTrainer):
         ):
             loss *= self.accelerator.num_processes if self.args.n_gpu <= 1 else self.args.n_gpu
 
-        return (loss, ar_outputs) if return_outputs else loss
+        return (loss, model_outputs) if return_outputs else loss
 
     def compute_loss(
         self,
@@ -1362,12 +1373,15 @@ class LTLMTrainer(SFTTrainer):
         if self.args.use_liger_kernel:
             inputs["return_token_accuracy"] = True
             inputs["use_token_scaling"] = self.args.loss_type == "dft"
-
+        
+        # for key, val in inputs.items():
+        #     if hasattr(val, "shape"):
+        #         print(f"inputs[{key}]: {val.shape}")
+        #     else:
+        #         print(f"inputs[{key}]: {type(val)}")
         (loss, outputs) = self._compute_loss(
             model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
         )
-
-
 
         # Compute entropy
         if not self.args.use_liger_kernel:  # liger doesn't return logits
@@ -1382,6 +1396,11 @@ class LTLMTrainer(SFTTrainer):
                     per_token_entropy = per_token_entropy[:, self.num_virtual_tokens :]
                 if "attention_mask" in inputs:
                     attention_mask = inputs["attention_mask"]
+                    # TODO: Claude code update, Double check it, Align sequence lengths if they differ (can happen with autoencoder models)
+                    min_len = min(per_token_entropy.size(1), attention_mask.size(1))
+                    per_token_entropy = per_token_entropy[:, :min_len]
+                    attention_mask = attention_mask[:, :min_len]
+                    # TODO: Claude code update ends
                     entropy = torch.sum(per_token_entropy * attention_mask) / attention_mask.sum()
                 elif "position_ids" in inputs:
                     entropy = torch.mean(per_token_entropy)
@@ -1425,6 +1444,12 @@ class LTLMTrainer(SFTTrainer):
                     and model.peft_config[model.active_adapter].peft_type != PeftType.PREFIX_TUNING
                 ):
                     shift_logits = shift_logits[:, self.num_virtual_tokens :, :]
+
+                # TODO: Claude code update, Double check it, Align sequence lengths if they differ (can happen with autoencoder models)
+                min_len = min(shift_logits.size(1), shift_labels.size(1))
+                shift_logits = shift_logits[:, :min_len, :]
+                shift_labels = shift_labels[:, :min_len]
+                # TODO: Claude code update ends, Double check it,
 
                 # Get predictions
                 predictions = shift_logits.argmax(dim=-1)
