@@ -65,7 +65,8 @@ from .utils import (
 from .sft_trainer import SFTTrainer
 from .latent_config import LTLMConfig
 from transformers.models.gpt2.modeling_gpt2 import GPT2Config
-from transformers.models.latent_gpt2.modeling_gpt2 import GPT2ModelBase, LanguageAutoencoder
+from transformers.models.latent_gpt2.modeling_gpt2 import GPT2ModelBase
+from transformers.models.latent_gpt2.modeling_autoencoder import LanguageAutoencoder
 from transformers.models.latent_gpt2.configuration_latent_gpt2 import LatentGPT2Config
 
 
