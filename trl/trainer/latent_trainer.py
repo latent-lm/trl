@@ -1263,7 +1263,9 @@ class LTLMTrainer(SFTTrainer):
 
         # if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
         if "labels" in inputs:
-            labels = inputs.pop("labels")
+            # Modified: Not removing labels from input
+            # labels = inputs.pop("labels")
+            labels = inputs["labels"]
         else:
             labels = None
         if self.model_accepts_loss_kwargs:
@@ -1310,7 +1312,8 @@ class LTLMTrainer(SFTTrainer):
         model_outputs = None
 
         # Objective 1: Reconstruction: Do not shift labels
-        rec_loss = self.compute_smoothed_loss(rec_outputs, labels, shift_labels=0)
+        # rec_loss = self.compute_smoothed_loss(rec_outputs, labels, shift_labels=0)
+        rec_loss = rec_outputs.loss
         loss += rec_loss
         model_outputs = rec_outputs
 
@@ -1318,17 +1321,17 @@ class LTLMTrainer(SFTTrainer):
         ar_outputs = None
         if self.model.fm is not None:
             inputs["use_latent_ar"] = True
-            ar_outputs, ltar_output, encoder_output = model(**inputs)
+            ae_output, encoder_output, decoder_output, fm_output = model(**inputs)
 
             # Objective 2: AR: Shift labels
-            ar_loss = self.compute_smoothed_loss(ar_outputs, labels, shift_labels=model.config.window_size)
-            loss += ar_loss
-
-            ltar_output_shifted = ltar_output.last_tail_hidden_state[:, :-1, :]
-            encoder_output_shifted = encoder_output.last_tail_hidden_state[:, 1:, :]
+            # ar_loss = self.compute_smoothed_loss(ar_outputs, labels, shift_labels=model.config.window_size)
+            # loss += ar_loss
 
             # Objective 3: Flow Matching
-            fm_loss = self.model.fm.compute_loss(ltar_output_shifted, encoder_output_shifted)
+            # ltar_output_shifted = ltar_output.last_tail_hidden_state[:, :-1, :]
+            # encoder_output_shifted = encoder_output.last_tail_hidden_state[:, 1:, :]
+            # fm_loss = self.model.fm.compute_loss(ltar_output_shifted, encoder_output_shifted)
+            fm_loss = fm_output.loss
             loss += fm_loss
 
             # else:
@@ -1340,7 +1343,7 @@ class LTLMTrainer(SFTTrainer):
             #     # We don't use .loss here since the model may return tuples instead of ModelOutput.
             #     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
             
-            model_outputs = ar_outputs
+            model_outputs = decoder_output
 
         if (
             self.args.average_tokens_across_devices
