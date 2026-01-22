@@ -603,12 +603,12 @@ class LTLMTrainer(SFTTrainer):
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             model_name = model_name.split("/")[-1]
-            args = SFTConfig(f"{model_name}-SFT")
+            args = LTLMConfig(f"{model_name}-SFT")
         elif isinstance(args, TrainingArguments) and not isinstance(args, SFTConfig):
             dict_args = args.to_dict()
             dict_args["hub_token"] = args.hub_token  # to_dict hides the hub_token
             dict_args.pop("push_to_hub_token")
-            args = SFTConfig(**dict_args)
+            args = LTLMConfig(**dict_args)
 
 
 
@@ -1319,7 +1319,7 @@ class LTLMTrainer(SFTTrainer):
 
         # If the model enables Latent-AR
         ar_outputs = None
-        if self.model.fm is not None:
+        if self.args.use_latent_ar:
             inputs["use_latent_ar"] = True
             ae_output, encoder_output, decoder_output, fm_output = model(**inputs)
 
@@ -1366,10 +1366,12 @@ class LTLMTrainer(SFTTrainer):
         """
         mode = "train" if self.model.training else "eval"
 
-        # Set aside labels as it will be dropped by super().compute_loss() if a custom `compute_loss_func` is used.
-        # This can be removed when this issue is fixed.
-        # When using CP or SP, labels are pre-shifted, we must use shift_labels instead.
-        labels = inputs["labels"] if "shift_labels" not in inputs else None
+        # # Set aside labels as it will be dropped by super().compute_loss() if a custom `compute_loss_func` is used.
+        # # This can be removed when this issue is fixed.
+        # # When using CP or SP, labels are pre-shifted, we must use shift_labels instead.
+        # labels = inputs["labels"] if "shift_labels" not in inputs else None
+
+        labels = inputs["labels"]
 
         # If not set, defaults from model config and may warn since cache isn't compatible with gradient checkpointing
         inputs["use_cache"] = False
@@ -1432,15 +1434,23 @@ class LTLMTrainer(SFTTrainer):
         else:
             # Compute accuracy from logits using argmax (traditional method)
             with torch.no_grad():
-                if "shift_labels" in inputs:
-                    # When using CP or SP, labels are pre-shifted. We must use these (and cannot manually shift) because:
-                    # - The first discarded token from inputs["labels"] actually belongs to process n-1
-                    # - The last logits require the label from process n+1
-                    shift_logits = outputs.logits.contiguous()
-                    shift_labels = inputs["shift_labels"]
+                # if "shift_labels" in inputs:
+                #     # When using CP or SP, labels are pre-shifted. We must use these (and cannot manually shift) because:
+                #     # - The first discarded token from inputs["labels"] actually belongs to process n-1
+                #     # - The last logits require the label from process n+1
+                #     shift_logits = outputs.logits.contiguous()
+                #     shift_labels = inputs["shift_labels"]
+                # else:
+                #     shift_logits = outputs.logits[..., :-1, :].contiguous()
+                #     shift_labels = labels[..., 1:].contiguous()
+                if self.args.use_latent_ar:
+                    # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
+                    shift_logits = outputs.logits[..., :-model.config.window_size, :].contiguous()
+                    shift_labels = labels[..., model.config.window_size:].contiguous()
                 else:
-                    shift_logits = outputs.logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
+                    # If use_latent_ar is false then outputs is reconstructing the tokens on the same position.
+                    shift_logits = outputs.logits.contiguous()
+                    shift_labels = labels.contiguous()
 
                 # Prompt Tuning and P-Tuning output logits for virtual tokens but Prefix-Tuning does not.
                 if (
@@ -1453,6 +1463,9 @@ class LTLMTrainer(SFTTrainer):
                 min_len = min(shift_logits.size(1), shift_labels.size(1))
                 shift_logits = shift_logits[:, :min_len, :]
                 shift_labels = shift_labels[:, :min_len]
+
+
+
                 # TODO: Claude code update ends, Double check it,
 
                 # Get predictions
