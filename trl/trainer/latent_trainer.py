@@ -961,6 +961,8 @@ class LTLMTrainer(SFTTrainer):
             self.model.add_model_tags(self._tag_names)
 
         self.aux_loss_enabled = getattr(model.config, "output_router_logits", False)
+        
+        self._forward_type = "latent_fm"
 
     def _prepare_dataset(
         self,
@@ -1230,6 +1232,13 @@ class LTLMTrainer(SFTTrainer):
         nll_loss = nll_loss.sum() / num_active_elements
         smoothed_loss = smoothed_loss.sum() / (num_active_elements * log_probs.shape[-1])
         return (1 - epsilon) * nll_loss + epsilon * smoothed_loss
+    
+    @property
+    def forward_type(self) -> str:
+        return self._forward_type
+
+    def set_forward_type(self, forward_type: str):
+        self._forward_type = forward_type
 
     def _compute_loss(
         self,
@@ -1261,11 +1270,25 @@ class LTLMTrainer(SFTTrainer):
         if pc is not None and pc.sp_backend == "deepspeed" and pc.sp_enabled:
             return self._deepspeed_sp_compute_loss(model, inputs, return_outputs, pc)
 
+        if "input_ids" in inputs and inputs["input_ids"] is not None:
+            if self.forward_type == "latent_fm" or self.forward_type == "fm":
+                # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
+                inputs["input_ids"] = inputs["input_ids"][..., :-model.config.window_size].contiguous()
+        
+        if "inputs_embeds" in inputs and inputs["inputs_embeds"] is not None:
+            if self.forward_type == "latent_fm" or self.forward_type == "fm":
+                # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
+                inputs["inputs_embeds"] = inputs["inputs_embeds"][..., :-model.config.window_size, :].contiguous()
+        
         # if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
-        if "labels" in inputs:
+        if "labels" in inputs and inputs["labels"] is not None:
             # Modified: Not removing labels from input
             # labels = inputs.pop("labels")
             labels = inputs["labels"]
+            
+            if self.forward_type == "latent_fm" or self.forward_type == "fm":
+                # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
+                labels = labels[..., -model.config.window_size:].contiguous()
         else:
             labels = None
         if self.model_accepts_loss_kwargs:
@@ -1274,8 +1297,8 @@ class LTLMTrainer(SFTTrainer):
                 kwargs["num_items_in_batch"] = num_items_in_batch
             inputs = {**inputs, **kwargs}
 
-        inputs["use_latent_ar"] = False
-        rec_outputs = model(**inputs)
+        inputs["forward_type"] = self.forward_type
+        model_outputs = model(**inputs)
 
         assert self.compute_loss_func is None
         assert labels is not None
@@ -1308,42 +1331,7 @@ class LTLMTrainer(SFTTrainer):
         # #     loss = self.label_smoother(outputs, labels)
 
         # Total loss & Final output
-        loss: float = 0
-        model_outputs = None
-
-        # Objective 1: Reconstruction: Do not shift labels
-        # rec_loss = self.compute_smoothed_loss(rec_outputs, labels, shift_labels=0)
-        rec_loss = rec_outputs.loss
-        loss += rec_loss
-        model_outputs = rec_outputs
-
-        # If the model enables Latent-AR
-        ar_outputs = None
-        if self.args.use_latent_ar:
-            inputs["use_latent_ar"] = True
-            ae_output, encoder_output, decoder_output, fm_output = model(**inputs)
-
-            # Objective 2: AR: Shift labels
-            # ar_loss = self.compute_smoothed_loss(ar_outputs, labels, shift_labels=model.config.window_size)
-            # loss += ar_loss
-
-            # Objective 3: Flow Matching
-            # ltar_output_shifted = ltar_output.last_tail_hidden_state[:, :-1, :]
-            # encoder_output_shifted = encoder_output.last_tail_hidden_state[:, 1:, :]
-            # fm_loss = self.model.fm.compute_loss(ltar_output_shifted, encoder_output_shifted)
-            fm_loss = fm_output.loss
-            loss += fm_loss
-
-            # else:
-            #     if isinstance(outputs, dict) and "loss" not in outputs:
-            #         raise ValueError(
-            #             "The model did not return a loss from the inputs, only the following keys: "
-            #             f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
-            #         )
-            #     # We don't use .loss here since the model may return tuples instead of ModelOutput.
-            #     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-            
-            model_outputs = decoder_output
+        loss: float = model_outputs.loss
 
         if (
             self.args.average_tokens_across_devices
@@ -1443,14 +1431,16 @@ class LTLMTrainer(SFTTrainer):
                 # else:
                 #     shift_logits = outputs.logits[..., :-1, :].contiguous()
                 #     shift_labels = labels[..., 1:].contiguous()
-                if self.args.use_latent_ar:
+                if self.forward_type == "latent_fm" or self.forward_type == "fm":
                     # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
-                    shift_logits = outputs.logits[..., :-model.config.window_size, :].contiguous()
-                    shift_labels = labels[..., model.config.window_size:].contiguous()
-                else:
+                    shift_logits = outputs.logits[..., -model.config.window_size:, :].contiguous()
+                    shift_labels = labels[..., -model.config.window_size:].contiguous()
+                elif self.forward_type == "autoencoder" or self.forward_type == "autoencoder_fm":
                     # If use_latent_ar is false then outputs is reconstructing the tokens on the same position.
                     shift_logits = outputs.logits.contiguous()
                     shift_labels = labels.contiguous()
+                else:
+                    raise NotImplementedError(f"forward_type: {self.forward_type} isn't supported.")
 
                 # Prompt Tuning and P-Tuning output logits for virtual tokens but Prefix-Tuning does not.
                 if (
@@ -1463,9 +1453,6 @@ class LTLMTrainer(SFTTrainer):
                 min_len = min(shift_logits.size(1), shift_labels.size(1))
                 shift_logits = shift_logits[:, :min_len, :]
                 shift_labels = shift_labels[:, :min_len]
-
-
-
                 # TODO: Claude code update ends, Double check it,
 
                 # Get predictions
@@ -1485,6 +1472,7 @@ class LTLMTrainer(SFTTrainer):
 
                 # Compute the mean token accuracy and log it
                 total_sum = total_tokens.sum()
+                # print(f"correct_tokens.sum(): {correct_tokens.sum()}, total_sum: {total_sum}")
                 accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
                 self._metrics[mode]["mean_token_accuracy"].append(accuracy)
 
