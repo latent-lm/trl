@@ -963,6 +963,7 @@ class LTLMTrainer(SFTTrainer):
         self.aux_loss_enabled = getattr(model.config, "output_router_logits", False)
         
         self._forward_type = "latent_fm"
+        self._is_sanity_check_identical_labels = False
 
     def _prepare_dataset(
         self,
@@ -1273,12 +1274,16 @@ class LTLMTrainer(SFTTrainer):
         if "input_ids" in inputs and inputs["input_ids"] is not None:
             if self.forward_type == "latent_fm" or self.forward_type == "fm":
                 # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
-                inputs["input_ids"] = inputs["input_ids"][..., :-model.config.window_size].contiguous()
+                shifted_input_ids = inputs["input_ids"][..., :-model.config.window_size].contiguous()
+                # print(f'ws - {model.config.window_size}, _compute_loss - inputs["input_ids"]: {inputs["input_ids"].shape}, shifted_input_ids: {shifted_input_ids.shape}')
+                inputs["input_ids"] = shifted_input_ids
         
         if "inputs_embeds" in inputs and inputs["inputs_embeds"] is not None:
             if self.forward_type == "latent_fm" or self.forward_type == "fm":
                 # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
-                inputs["inputs_embeds"] = inputs["inputs_embeds"][..., :-model.config.window_size, :].contiguous()
+                shifted_inputs_embeds = inputs["inputs_embeds"][..., :-model.config.window_size, :].contiguous()
+                # print(f'ws - {model.config.window_size}, _compute_loss - inputs["inputs_embeds"]: {inputs["inputs_embeds"].shape}, shifted_inputs_embeds: {shifted_inputs_embeds.shape}')
+                inputs["inputs_embeds"] = shifted_inputs_embeds
         
         # if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
         if "labels" in inputs and inputs["labels"] is not None:
@@ -1286,9 +1291,11 @@ class LTLMTrainer(SFTTrainer):
             # labels = inputs.pop("labels")
             labels = inputs["labels"]
             
-            if self.forward_type == "latent_fm" or self.forward_type == "fm":
-                # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
-                labels = labels[..., -model.config.window_size:].contiguous()
+            # print(f'ws - {model.config.window_size}, _compute_loss - inputs["labels"]: {inputs["labels"].shape}, labels: {labels.shape}')
+            
+            # if self.forward_type == "latent_fm" or self.forward_type == "fm":
+            #     # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
+            #     labels = labels[..., -model.config.window_size:].contiguous()
         else:
             labels = None
         if self.model_accepts_loss_kwargs:
@@ -1341,6 +1348,14 @@ class LTLMTrainer(SFTTrainer):
             loss *= self.accelerator.num_processes if self.args.n_gpu <= 1 else self.args.n_gpu
 
         return (loss, model_outputs) if return_outputs else loss
+    
+    def enable_sanity_check_identical_labels(self):
+        self._is_sanity_check_identical_labels = True
+        
+    def _sanity_check_labels(self, labels):
+        if self._is_sanity_check_identical_labels:
+            return torch.ones(*labels.shape, device=labels.device, dtype=labels.dtype) * 42
+        return labels
 
     def compute_loss(
         self,
@@ -1359,6 +1374,7 @@ class LTLMTrainer(SFTTrainer):
         # # When using CP or SP, labels are pre-shifted, we must use shift_labels instead.
         # labels = inputs["labels"] if "shift_labels" not in inputs else None
 
+        inputs["labels"] = self._sanity_check_labels(labels=inputs["labels"])
         labels = inputs["labels"]
 
         # If not set, defaults from model config and may warn since cache isn't compatible with gradient checkpointing
@@ -1434,7 +1450,9 @@ class LTLMTrainer(SFTTrainer):
                 if self.forward_type == "latent_fm" or self.forward_type == "fm":
                     # If use_latent_ar is true then outputs passes through the latent AR model, which are predicting the next block and are shifted by window_size
                     shift_logits = outputs.logits[..., -model.config.window_size:, :].contiguous()
+                    # print(f'ws - {model.config.window_size}, compute_loss - outputs.logits: {outputs.logits.shape}, shift_logits: {shift_logits.shape}')
                     shift_labels = labels[..., -model.config.window_size:].contiguous()
+                    # print(f'ws - {model.config.window_size}, compute_loss - labels: {labels.shape}, shift_labels: {shift_labels.shape}, {shift_labels}')
                 elif self.forward_type == "autoencoder" or self.forward_type == "autoencoder_fm":
                     # If use_latent_ar is false then outputs is reconstructing the tokens on the same position.
                     shift_logits = outputs.logits.contiguous()
@@ -1457,6 +1475,7 @@ class LTLMTrainer(SFTTrainer):
 
                 # Get predictions
                 predictions = shift_logits.argmax(dim=-1)
+                # print(f"predictions: {predictions}")
 
                 # Create mask for non-padding tokens (assuming ignore_index is -100)
                 mask = shift_labels != -100
