@@ -1354,6 +1354,9 @@ class LTLMTrainer(SFTTrainer):
         
     def _sanity_check_labels(self, labels):
         if self._is_sanity_check_identical_labels:
+            # modes = torch.tensor([41, 42, 43], dtype=torch.long, device=labels.device)
+            # idx = torch.randint(low=0, high=len(modes), size=labels.shape, device=labels.device)
+            # return modes[idx]
             return torch.ones(*labels.shape, device=labels.device, dtype=labels.dtype) * 42
         return labels
 
