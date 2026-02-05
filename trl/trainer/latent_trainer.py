@@ -1356,6 +1356,76 @@ class LTLMTrainer(SFTTrainer):
         if self._is_sanity_check_identical_labels:
             return torch.ones(*labels.shape, device=labels.device, dtype=labels.dtype) * 42
         return labels
+    
+    def compute_acc(self, logits: torch.FloatTensor, labels: torch.LongTensor):
+        # Get predictions
+        predictions = logits.argmax(dim=-1)
+        # print(f"predictions: {predictions}")
+
+        # Create mask for non-padding tokens (assuming ignore_index is -100)
+        mask = labels != -100
+
+        # Calculate accuracy only on non-padding tokens
+        correct_predictions = (predictions == labels) & mask
+        total_tokens = mask.sum()
+        correct_tokens = correct_predictions.sum()
+
+        # Gather the correct_tokens and total_tokens across all processes
+        correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)
+        total_tokens = self.accelerator.gather_for_metrics(total_tokens)
+
+        # Compute the mean token accuracy and log it
+        total_sum = total_tokens.sum()
+        # print(f"correct_tokens.sum(): {correct_tokens.sum()}, total_sum: {total_sum}")
+        accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
+        return float(accuracy)
+    
+    def compute_perplexity(self, logits: torch.FloatTensor, labels: torch.LongTensor):
+        # Compute log probabilities
+        log_probs = nn.functional.log_softmax(logits, dim=-1)
+
+        # Create mask for non-padding tokens (assuming ignore_index is -100)
+        mask = labels != -100
+
+        # Replace -100 with 0 for gathering (will be masked out anyway)
+        labels_for_gather = labels.clone()
+        labels_for_gather[~mask] = 0
+
+        # Gather the log probabilities for the correct labels
+        # log_probs shape: (batch, seq_len, vocab_size)
+        # labels_for_gather shape: (batch, seq_len)
+        gathered_log_probs = log_probs.gather(dim=-1, index=labels_for_gather.unsqueeze(-1)).squeeze(-1)
+
+        # Apply mask and compute negative log likelihood
+        nll = -gathered_log_probs * mask
+
+        # Sum NLL and count tokens
+        total_nll = nll.sum()
+        total_tokens = mask.sum()
+
+        # Gather across all processes
+        total_nll = self.accelerator.gather_for_metrics(total_nll)
+        total_tokens = self.accelerator.gather_for_metrics(total_tokens)
+
+        # Compute mean NLL and perplexity
+        total_nll_sum = total_nll.sum()
+        total_tokens_sum = total_tokens.sum()
+        mean_nll = total_nll_sum / total_tokens_sum if total_tokens_sum > 0 else 0.0
+        perplexity = torch.exp(mean_nll).item() if total_tokens_sum > 0 else float('inf')
+
+        return float(perplexity)
+    
+    def compute_latent_stats(self, latents: torch.FloatTensor):
+        latents_mean = latents.mean()
+        latents_var = latents.var()
+        latents_min = latents.min()
+        latents_max = latents.max()
+
+        res_mean: torch.FloatTensor = self.accelerator.gather_for_metrics(latents_mean)
+        res_variance: torch.FloatTensor = self.accelerator.gather_for_metrics(latents_var)
+        res_minimum: torch.FloatTensor = self.accelerator.gather_for_metrics(latents_min)
+        res_maximum: torch.FloatTensor = self.accelerator.gather_for_metrics(latents_max)
+        return float(res_mean), float(res_variance), float(res_minimum), float(res_maximum)
 
     def compute_loss(
         self,
@@ -1435,6 +1505,8 @@ class LTLMTrainer(SFTTrainer):
         if self.args.use_liger_kernel:
             token_accuracy = self.accelerator.gather_for_metrics(outputs.token_accuracy).mean().item()
             self._metrics[mode]["mean_token_accuracy"].append(token_accuracy)
+            perplexity = self.accelerator.gather_for_metrics(outputs.perplexity).mean().item()
+            self._metrics[mode]["mean_perplexity"].append(perplexity)
         else:
             # Compute accuracy from logits using argmax (traditional method)
             with torch.no_grad():
@@ -1494,6 +1566,14 @@ class LTLMTrainer(SFTTrainer):
                 # print(f"correct_tokens.sum(): {correct_tokens.sum()}, total_sum: {total_sum}")
                 accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
                 self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+                
+                self._metrics[mode]["mean_token_accuracy_fn"].append(self.compute_acc(logits=shift_logits, labels=shift_labels))
+                self._metrics[mode]["mean_perplexity"].append(self.compute_perplexity(logits=shift_logits, labels=shift_labels))
+                latent_mean, latent_var, latent_min, latent_max = self.compute_latent_stats(latents=outputs.latents)
+                self._metrics[mode]["latent_mean"].append(latent_mean)
+                self._metrics[mode]["latent_var"].append(latent_var)
+                self._metrics[mode]["latent_min"].append(latent_min)
+                self._metrics[mode]["latent_max"].append(latent_max)
 
         # Log auxiliary loss if enabled (applies to both Liger and non-Liger)
         if self.aux_loss_enabled:
